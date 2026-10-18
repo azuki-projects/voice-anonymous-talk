@@ -33,6 +33,23 @@ if (portIdx !== -1 && args[portIdx + 1]) {
 const connectedSockets = new Map(); // socket.id -> { socketId, userId, username, avatar, inCall, roomId, searching }
 const matchmakingQueue = []; // array of socketIds in order
 const activeRooms = new Map(); // roomId -> { id, userA: socketId, userB: socketId, startedAt }
+// 4-Code Group Voice Rooms (Max 10 users per group)
+const groupRooms = new Map(); // 4-code -> { code, hostSocketId, hostPermanentId, started, startedAt, members: Map<socketId, memberData> }
+const MAX_GROUP_USERS = 10;
+
+function generateGroupCode() {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  let attempts = 0;
+  do {
+    code = '';
+    for (let i = 0; i < 4; i++) {
+      code += chars[Math.floor(Math.random() * chars.length)];
+    }
+    attempts++;
+  } while (groupRooms.has(code) && attempts < 100);
+  return code;
+}
 
 function broadcastStats() {
   const onlineCount = connectedSockets.size;
@@ -128,20 +145,22 @@ function attemptMatchmaking() {
 // SOCKET.IO SIGNALING & EVENTS
 // -------------------------------------------------------------
 io.on('connection', (socket) => {
-  // Client registers with username, avatar, and persistent client-generated userId & permanentId
-  socket.on('user:register', ({ userId, permanentId, username, avatar }) => {
+  // Client registers with username, avatar, and persistent client-generated userId, permanentId & groupPermanentId
+  socket.on('user:register', ({ userId, permanentId, groupPermanentId, username, avatar }) => {
     const cleanPermId = (permanentId || userId || ('ZK-' + socket.id.slice(0, 6).toUpperCase())).trim().toUpperCase();
+    const cleanGroupPermId = (groupPermanentId || cleanPermId.replace('ZK-', '').slice(0, 4) || '8A4F').trim().toUpperCase();
     connectedSockets.set(socket.id, {
       socketId: socket.id,
       userId: userId || ('user_' + socket.id),
       permanentId: cleanPermId,
+      groupPermanentId: cleanGroupPermId,
       username: (username || 'Anonymous').trim().slice(0, 24),
       avatar: avatar || '🦊',
       inCall: false,
       roomId: null,
       searching: false
     });
-    socket.emit('user:registered', { permanentId: cleanPermId });
+    socket.emit('user:registered', { permanentId: cleanPermId, groupPermanentId: cleanGroupPermId });
     broadcastStats();
   });
 
@@ -403,6 +422,213 @@ io.on('connection', (socket) => {
     broadcastStats();
   });
 
+  // -------------------------------------------------------------
+  // GROUP VOICE CALL (4-CODE ROOMS, MAX 10 USERS)
+  // -------------------------------------------------------------
+  function handleUserLeaveGroup(socketId) {
+    const user = connectedSockets.get(socketId);
+    if (!user || !user.groupCode) return;
+    const code = user.groupCode;
+    const room = groupRooms.get(code);
+    if (room) {
+      room.members.delete(socketId);
+      const remaining = Array.from(room.members.values());
+      if (remaining.length === 0) {
+        groupRooms.delete(code);
+      } else {
+        if (room.hostSocketId === socketId && remaining[0]) {
+          room.hostSocketId = remaining[0].socketId;
+          room.hostPermanentId = remaining[0].permanentId;
+          remaining[0].isHost = true;
+        }
+        io.to('group_' + code).emit('group:member_left', {
+          leftSocketId: socketId,
+          totalCount: remaining.length,
+          allMembers: remaining
+        });
+      }
+    }
+    user.inCall = false;
+    user.groupCode = null;
+    broadcastStats();
+  }
+
+  // Check group status
+  socket.on('group:check', ({ code }) => {
+    const cleanCode = (code || '').trim().toUpperCase();
+    if (!cleanCode || cleanCode.length !== 4) {
+      return socket.emit('group:status', { code: cleanCode, status: 'invalid', message: 'Group code must be exactly 4 characters.' });
+    }
+    const room = groupRooms.get(cleanCode);
+    if (!room || !room.started) {
+      return socket.emit('group:status', {
+        code: cleanCode,
+        status: 'not_started',
+        message: ': this group hasn\'t started by user'
+      });
+    }
+    if (room.members.size >= MAX_GROUP_USERS) {
+      return socket.emit('group:status', {
+        code: cleanCode,
+        status: 'full',
+        message: ': this group is full (10)'
+      });
+    }
+    return socket.emit('group:status', {
+      code: cleanCode,
+      status: 'available',
+      memberCount: room.members.size,
+      message: `Group ${cleanCode} is ACTIVE (${room.members.size}/10 members). Ready to join!`
+    });
+  });
+
+  // Create group room (Starts user's 4-code group room)
+  socket.on('group:create', ({ customCode }) => {
+    const user = connectedSockets.get(socket.id);
+    if (!user) return;
+
+    let code = (customCode || user.groupPermanentId || '').trim().toUpperCase();
+    if (code && code.length === 4) {
+      if (groupRooms.has(code)) {
+        const existing = groupRooms.get(code);
+        if (existing && existing.started) {
+          // If already inside
+          if (existing.members.has(socket.id)) return;
+          // If room is full (10)
+          if (existing.members.size >= MAX_GROUP_USERS) {
+            return socket.emit('group:error', {
+              code,
+              reason: 'full',
+              message: ': this group is full (10)'
+            });
+          }
+          // If this user is returning host or room is active, join existing or take over host
+          if (existing.hostPermanentId === user.permanentId) {
+            existing.hostSocketId = socket.id;
+          }
+        }
+      }
+    } else {
+      code = generateGroupCode();
+    }
+
+    if (user.roomId) socket.emit('call:end');
+    if (user.groupCode) handleUserLeaveGroup(socket.id);
+
+    const newGroup = {
+      code,
+      hostSocketId: socket.id,
+      hostPermanentId: user.permanentId,
+      started: true,
+      startedAt: Date.now(),
+      members: new Map()
+    };
+    const hostMember = {
+      socketId: socket.id,
+      userId: user.userId,
+      permanentId: user.permanentId,
+      username: user.username,
+      avatar: user.avatar,
+      isHost: true
+    };
+    newGroup.members.set(socket.id, hostMember);
+    groupRooms.set(code, newGroup);
+    socket.join('group_' + code);
+
+    user.inCall = true;
+    user.groupCode = code;
+
+    socket.emit('group:joined_success', {
+      groupCode: code,
+      isHost: true,
+      myMember: hostMember,
+      existingMembers: [],
+      allMembers: [hostMember]
+    });
+    broadcastStats();
+  });
+
+  // Join group room
+  socket.on('group:join', ({ code }) => {
+    const user = connectedSockets.get(socket.id);
+    if (!user) return;
+
+    const cleanCode = (code || '').trim().toUpperCase();
+    if (!cleanCode || cleanCode.length !== 4) {
+      return socket.emit('group:error', { message: 'Group code must be 4 characters.' });
+    }
+
+    const room = groupRooms.get(cleanCode);
+    if (!room || !room.started) {
+      return socket.emit('group:error', {
+        code: cleanCode,
+        reason: 'not_started',
+        message: ': this group hasn\'t started by user'
+      });
+    }
+
+    if (room.members.size >= MAX_GROUP_USERS) {
+      return socket.emit('group:error', {
+        code: cleanCode,
+        reason: 'full',
+        message: ': this group is full (10)'
+      });
+    }
+
+    if (user.roomId) socket.emit('call:end');
+    if (user.groupCode && user.groupCode !== cleanCode) handleUserLeaveGroup(socket.id);
+
+    const memberData = {
+      socketId: socket.id,
+      userId: user.userId,
+      permanentId: user.permanentId,
+      username: user.username,
+      avatar: user.avatar,
+      isHost: false
+    };
+
+    const existingMembers = Array.from(room.members.values());
+    room.members.set(socket.id, memberData);
+    socket.join('group_' + cleanCode);
+
+    user.inCall = true;
+    user.groupCode = cleanCode;
+
+    socket.emit('group:joined_success', {
+      groupCode: cleanCode,
+      isHost: false,
+      myMember: memberData,
+      existingMembers: existingMembers,
+      allMembers: Array.from(room.members.values())
+    });
+
+    socket.to('group_' + cleanCode).emit('group:member_joined', {
+      newMember: memberData,
+      totalCount: room.members.size,
+      allMembers: Array.from(room.members.values())
+    });
+    broadcastStats();
+  });
+
+  // Leave group room
+  socket.on('group:leave', () => {
+    handleUserLeaveGroup(socket.id);
+    socket.emit('group:left');
+  });
+
+  // Group WebRTC mesh signaling
+  socket.on('group:signal:offer', ({ toSocketId, offer }) => {
+    io.to(toSocketId).emit('group:signal:offer', { fromSocketId: socket.id, offer });
+  });
+
+  socket.on('group:signal:answer', ({ toSocketId, answer }) => {
+    io.to(toSocketId).emit('group:signal:answer', { fromSocketId: socket.id, answer });
+  });
+
+  socket.on('group:signal:candidate', ({ toSocketId, candidate }) => {
+    io.to(toSocketId).emit('group:signal:candidate', { fromSocketId: socket.id, candidate });
+  });
+
   // Disconnect handler
   socket.on('disconnect', () => {
     const user = connectedSockets.get(socket.id);
@@ -423,6 +649,9 @@ io.on('connection', (socket) => {
       });
       activeRooms.delete(user.roomId);
     }
+
+    // If was in a group call, leave and notify group members
+    handleUserLeaveGroup(socket.id);
 
     connectedSockets.delete(socket.id);
     broadcastStats();
@@ -1294,6 +1523,206 @@ app.get('*', (req, res) => {
       color: #34d399;
     }
 
+    /* GROUP CALL STYLING & DYNAMIC AUTO ARRANGE */
+    .group-container {
+      width: 100%;
+      max-width: 840px;
+      background: var(--bg-card);
+      border: 1px solid var(--bg-card-border);
+      backdrop-filter: blur(16px);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    .group-code-badge {
+      font-family: 'Space Grotesk', monospace;
+      font-size: 1.15rem;
+      font-weight: 800;
+      background: var(--accent-subtle);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      padding: 0.25rem 0.75rem;
+      border-radius: 8px;
+      letter-spacing: 0.08em;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+    }
+
+    .group-grid {
+      display: grid;
+      gap: 0.75rem;
+      width: 100%;
+      margin: 0.5rem 0;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    /* Auto arrange smaller if many users (1 to 10 users) */
+    .group-grid.layout-1-2 {
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+    .group-grid.layout-3-4 {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.85rem;
+    }
+    .group-grid.layout-5-6 {
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+    }
+    .group-grid.layout-7-8 {
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.6rem;
+    }
+    .group-grid.layout-9-10,
+    .group-grid.layout-7-10 {
+      grid-template-columns: repeat(5, 1fr);
+      gap: 0.5rem;
+    }
+
+    @media (max-width: 860px) {
+      .group-grid.layout-5-6 {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .group-grid.layout-7-8 {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .group-grid.layout-9-10,
+      .group-grid.layout-7-10 {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    .group-member-card {
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: var(--radius-md);
+      padding: 1.15rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      position: relative;
+      transition: all 0.25s ease;
+      min-height: 110px;
+      justify-content: center;
+    }
+
+    .group-member-card.talking {
+      border-color: var(--accent);
+      box-shadow: 0 0 22px var(--accent-glow);
+    }
+
+    .group-member-card .host-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      font-size: 0.65rem;
+      font-weight: 800;
+      background: rgba(245, 158, 11, 0.2);
+      border: 1px solid #f59e0b;
+      color: #fbbf24;
+      padding: 2px 6px;
+      border-radius: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* Auto arrange smaller layout for 5 - 6 users */
+    .group-grid.layout-5-6 .group-member-card {
+      padding: 0.85rem 0.5rem;
+      min-height: 100px;
+    }
+    .group-grid.layout-5-6 .participant-avatar {
+      width: 48px;
+      height: 48px;
+      font-size: 1.5rem;
+      margin-bottom: 0.35rem;
+    }
+    .group-grid.layout-5-6 .participant-name {
+      font-size: 0.9rem;
+    }
+    .group-grid.layout-5-6 .wave-canvas {
+      height: 22px;
+    }
+
+    /* Auto arrange smaller layout for 7 - 8 users */
+    .group-grid.layout-7-8 .group-member-card {
+      padding: 0.65rem 0.4rem;
+      border-radius: var(--radius-sm);
+      min-height: 90px;
+    }
+    .group-grid.layout-7-8 .participant-avatar {
+      width: 42px;
+      height: 42px;
+      font-size: 1.35rem;
+      margin-bottom: 0.3rem;
+    }
+    .group-grid.layout-7-8 .participant-name {
+      font-size: 0.85rem;
+      max-width: 105px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .group-grid.layout-7-8 .participant-role {
+      font-size: 0.66rem;
+      margin-bottom: 0.2rem;
+    }
+    .group-grid.layout-7-8 .wave-canvas {
+      height: 18px;
+    }
+    .group-grid.layout-7-8 .host-badge {
+      top: 4px;
+      right: 4px;
+      font-size: 0.55rem;
+      padding: 1px 4px;
+    }
+
+    /* Auto arrange even smaller layout for 9 - 10 users */
+    .group-grid.layout-9-10 .group-member-card,
+    .group-grid.layout-7-10 .group-member-card {
+      padding: 0.5rem 0.3rem;
+      border-radius: var(--radius-sm);
+      min-height: 82px;
+    }
+    .group-grid.layout-9-10 .participant-avatar,
+    .group-grid.layout-7-10 .participant-avatar {
+      width: 34px;
+      height: 34px;
+      font-size: 1.15rem;
+      margin-bottom: 0.2rem;
+    }
+    .group-grid.layout-9-10 .participant-name,
+    .group-grid.layout-7-10 .participant-name {
+      font-size: 0.78rem;
+      max-width: 90px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .group-grid.layout-9-10 .participant-role,
+    .group-grid.layout-7-10 .participant-role {
+      font-size: 0.62rem;
+      margin-bottom: 0.15rem;
+    }
+    .group-grid.layout-9-10 .wave-canvas,
+    .group-grid.layout-7-10 .wave-canvas {
+      height: 14px;
+    }
+    .group-grid.layout-9-10 .host-badge,
+    .group-grid.layout-7-10 .host-badge {
+      top: 3px;
+      right: 3px;
+      font-size: 0.5rem;
+      padding: 1px 3px;
+    }
+
     /* CALL CONTROLS */
     .call-controls {
       display: flex;
@@ -1840,12 +2269,20 @@ app.get('*', (req, res) => {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="m18 15-6-6-6 6"/></svg>
           </div>
 
-          <div class="permanent-id-chip" onclick="copyPermanentId()" title="Click to copy your Permanent ID">
+          <div class="permanent-id-chip" onclick="copyPermanentId()" title="Click to copy your 1-on-1 Permanent ID">
             <div style="text-align: left;">
-              <div style="font-size: 0.72rem; color: var(--accent); font-weight: 700; text-transform: uppercase;">Your Permanent ID</div>
+              <div style="font-size: 0.72rem; color: var(--accent); font-weight: 700; text-transform: uppercase;">1-on-1 ID</div>
               <div style="font-size: 0.95rem; font-family: 'Space Grotesk', monospace; font-weight: 800; letter-spacing: 0.05em;" id="homePermanentIdPreview">ZK-XXXXXX</div>
             </div>
             <span id="copyIdBtnText" class="copy-badge">📋 Copy</span>
+          </div>
+
+          <div class="permanent-id-chip" onclick="copyGroupPermanentId()" title="Click to copy your Group 4-Code Permanent ID" style="border-color: rgba(0, 240, 255, 0.4); background: rgba(0, 240, 255, 0.06);">
+            <div style="text-align: left;">
+              <div style="font-size: 0.72rem; color: #00f0ff; font-weight: 700; text-transform: uppercase;">Group 4-Code</div>
+              <div style="font-size: 0.95rem; font-family: 'Space Grotesk', monospace; font-weight: 800; letter-spacing: 0.08em; color: #00f0ff;" id="homeGroupPermanentIdPreview">----</div>
+            </div>
+            <span id="copyGroupIdBtnText" class="copy-badge" style="border-color: #00f0ff; color: #00f0ff; background: rgba(0, 240, 255, 0.15);">📋 Copy</span>
           </div>
         </div>
 
@@ -1876,6 +2313,56 @@ app.get('*', (req, res) => {
 
           <!-- Live Status feedback banner -->
           <div id="directStatusBanner" class="direct-status-banner" style="display: none;"></div>
+        </div>
+
+        <!-- NEW MODE: GROUP VOICE CALL (4-CODE ROOMS, MAX 10 USERS) -->
+        <div class="direct-call-box" style="border-color: rgba(0, 240, 255, 0.28); box-shadow: 0 0 20px rgba(0, 240, 255, 0.05);">
+          <div class="direct-call-header">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span style="font-size: 1.15rem;">👥</span>
+              <span style="font-weight: 800; font-size: 1rem; color: #00f0ff;">Group Voice Call (4-Code ID)</span>
+            </div>
+            <span style="font-size: 0.72rem; font-weight: 800; color: #00f0ff; background: rgba(0, 240, 255, 0.12); border: 1px solid rgba(0, 240, 255, 0.3); padding: 2px 8px; border-radius: 12px; text-transform: uppercase;">Max 10 Users</span>
+          </div>
+
+          <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 1rem; line-height: 1.45;">
+            Join or start an encrypted multi-user voice room using a 4-code permanent ID. Auto-arranges up to 10 participants.
+          </p>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
+            <!-- Start Your Permanent Group -->
+            <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); padding: 0.9rem; border-radius: var(--radius-sm); text-align: left; display: flex; flex-direction: column; justify-content: space-between;">
+              <div>
+                <div style="font-size: 0.75rem; font-weight: 800; text-transform: uppercase; color: var(--accent); margin-bottom: 0.35rem; letter-spacing: 0.05em;">👑 Host Your Group</div>
+                <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.3); padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); margin-bottom: 0.6rem;">
+                  <span style="font-size: 0.75rem; color: var(--text-muted);">Your 4-Code:</span>
+                  <span id="myGroupCodeBadge" style="font-family: 'Space Grotesk', monospace; font-weight: 800; font-size: 1.05rem; color: #00f0ff; letter-spacing: 0.08em;">----</span>
+                </div>
+              </div>
+              <button class="start-call-btn" id="startMyGroupBtn" style="width: 100%; padding: 0.75rem 0.5rem; font-size: 0.9rem; margin: 0;" onclick="startMyPermanentGroupCall()">
+                <span id="startMyGroupBtnText">🔥 Start My Group</span>
+              </button>
+            </div>
+
+            <!-- Join Existing Group by 4-Code -->
+            <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); padding: 0.9rem; border-radius: var(--radius-sm); text-align: left; display: flex; flex-direction: column; justify-content: space-between;">
+              <div>
+                <div style="font-size: 0.75rem; font-weight: 800; text-transform: uppercase; color: #00f0ff; margin-bottom: 0.4rem; letter-spacing: 0.05em;">🔑 Join a Group</div>
+                <input type="text" id="joinGroupCodeInput" class="direct-id-input" placeholder="Enter 4-Code" maxlength="4" style="text-align: center; font-size: 1.05rem; width: 100%; margin-bottom: 0.6rem; text-transform: uppercase;" oninput="this.value = this.value.toUpperCase()">
+              </div>
+              <div style="display: flex; gap: 0.4rem;">
+                <button class="check-online-btn" style="flex: 1; padding: 0.7rem 0.4rem; font-size: 0.8rem;" onclick="checkGroupRoomStatus()">
+                  🔍 Check
+                </button>
+                <button class="direct-call-action-btn" style="flex: 1.3; padding: 0.7rem 0.5rem; font-size: 0.82rem; background: linear-gradient(135deg, #00f0ff 0%, #0077ff 100%); color: #000; font-weight: 900;" onclick="joinGroupCall()">
+                  🎙️ Join (10)
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Group Live Status feedback banner (displays : this group hasn't started by user / : this group is full (10)) -->
+          <div id="groupStatusBanner" class="direct-status-banner" style="display: none;"></div>
         </div>
 
         <div class="feature-strip">
@@ -2017,6 +2504,70 @@ app.get('*', (req, res) => {
       </div>
     </div>
 
+    <!-- 5. GROUP VOICE CALL ROOM (UP TO 10 USERS, AUTO ARRANGE) -->
+    <div id="groupCallScreen" class="screen">
+      <div class="group-container">
+        <div class="call-top-bar">
+          <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+            <div class="call-badge" style="background: rgba(0, 240, 255, 0.12); border-color: rgba(0, 240, 255, 0.3); color: #00f0ff;">
+              <span class="live-dot" style="background:#00f0ff; box-shadow: 0 0 10px #00f0ff;"></span>
+              <span>GROUP VOICE ACTIVE</span>
+            </div>
+            <div class="group-code-badge" onclick="copyGroupRoomCode()" title="Click to copy 4-Code">
+              <span style="font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase;">ROOM:</span>
+              <span id="currentGroupCodeDisplay">----</span>
+              <span id="copyGroupCodeBtnText" style="font-size: 0.72rem; background: rgba(255,255,255,0.12); padding: 2px 6px; border-radius: 4px;">📋 Copy</span>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: 0.75rem;">
+            <div class="live-status-pill" id="groupMemberCountBadge" style="background: rgba(0, 240, 255, 0.1); border-color: rgba(0, 240, 255, 0.3); color: #00f0ff;">
+              👥 <span id="groupCountText">1 / 10 Users</span>
+            </div>
+            <div class="call-timer" id="groupCallTimer">00:00</div>
+          </div>
+        </div>
+
+        <div id="groupPttBanner" class="ptt-banner">
+          ⌨️ PUSH-TO-TALK ACTIVE: Hold <strong>SPACEBAR</strong> to talk
+        </div>
+
+        <!-- DYNAMIC AUTO-ARRANGING PARTICIPANTS GRID (UP TO 10 USERS) -->
+        <div id="groupGrid" class="group-grid layout-1-2">
+          <!-- Populated by renderGroupGrid() -->
+        </div>
+
+        <!-- Controls Bar -->
+        <div class="call-controls">
+          <div class="volume-row">
+            <label>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+              Group Master Volume
+            </label>
+            <input type="range" class="volume-slider" id="groupVolumeSlider" min="0" max="150" value="100" oninput="adjustGroupVolume(this.value)">
+            <span id="groupVolumePercentText" style="font-size:0.8rem; font-family:monospace; min-width:35px;">100%</span>
+          </div>
+
+          <div class="action-buttons-row">
+            <button class="ctrl-btn" id="groupMuteMicBtn" onclick="toggleMuteMic()">
+              <svg id="groupMuteMicIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+              <span id="groupMuteMicText">Mute Mic</span>
+            </button>
+
+            <button class="ctrl-btn" onclick="openModal('settingsModal')">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/></svg>
+              <span>Audio Config</span>
+            </button>
+
+            <button class="end-call-btn" onclick="leaveGroupCall()">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/><line x1="22" y1="2" x2="2" y2="22"/></svg>
+              <span>LEAVE GROUP</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- FOOTER -->
     <footer>
       <div>✨ made with Azuki ✨ • 100% Real Live Voice Talk</div>
@@ -2024,8 +2575,10 @@ app.get('*', (req, res) => {
     </footer>
   </div>
 
-  <!-- HIDDEN AUDIO ELEMENT FOR STRANGER -->
+  <!-- HIDDEN AUDIO ELEMENT FOR 1-ON-1 STRANGER -->
   <audio id="remoteAudio" autoplay playsinline></audio>
+  <!-- HIDDEN AUDIO CONTAINER FOR GROUP ROOM PEERS -->
+  <div id="groupAudiosContainer" style="display: none;"></div>
 
   <!-- MODAL 1: USERNAME & AVATAR MODAL -->
   <div class="modal-overlay" id="usernameModal">
@@ -2263,6 +2816,18 @@ app.get('*', (req, res) => {
       localStorage.setItem('zuki_permanent_id', myPermanentId);
     }
 
+    // Four-code permanent ID for user's group
+    let myGroupPermanentId = localStorage.getItem('zuki_group_permanent_id');
+    if (!myGroupPermanentId) {
+      const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+      let gCode = '';
+      for (let i = 0; i < 4; i++) {
+        gCode += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      myGroupPermanentId = gCode;
+      localStorage.setItem('zuki_group_permanent_id', myGroupPermanentId);
+    }
+
     let myUserId = localStorage.getItem('zuki_user_uid');
     if (!myUserId) {
       myUserId = 'zuki_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();
@@ -2277,6 +2842,17 @@ app.get('*', (req, res) => {
     let currentOutgoingTargetId = null;
     let pendingIncomingCall = null;
     let ringInterval = null;
+
+    // Group Voice Calling State (4-code rooms, max 10 users)
+    let currentGroupCode = null;
+    let isGroupHost = false;
+    let groupMembers = new Map(); // socketId -> memberData
+    let groupPeerConnections = new Map(); // socketId -> RTCPeerConnection
+    let groupAudioStreams = new Map(); // socketId -> MediaStream
+    let groupAnalysers = new Map(); // socketId -> AnalyserNode
+    let groupCallTimerInterval = null;
+    let groupCallSeconds = 0;
+    let groupMasterVolume = 100;
 
     // Pleasant audio ringtone generator using Web Audio API
     function playRingtone(isOutgoing) {
@@ -2326,6 +2902,7 @@ app.get('*', (req, res) => {
         randomizeCodename();
       }
       updateHomeProfileDisplay();
+      randomizeGroupCodeInput();
 
       // Enumerate audio devices
       refreshAudioDevices();
@@ -2356,6 +2933,7 @@ app.get('*', (req, res) => {
       socket.emit('user:register', {
         userId: myUserId,
         permanentId: myPermanentId,
+        groupPermanentId: myGroupPermanentId,
         username: myUsername || 'Ronin_99',
         avatar: myAvatar
       });
@@ -2379,6 +2957,32 @@ app.get('*', (req, res) => {
       }).catch(() => {
         prompt('Your Permanent ID (Press Ctrl+C to copy):', myPermanentId);
       });
+    }
+
+    function copyGroupPermanentId() {
+      if (!myGroupPermanentId) return;
+      navigator.clipboard.writeText(myGroupPermanentId).then(() => {
+        const btn = document.getElementById('copyGroupIdBtnText');
+        if (btn) {
+          const original = btn.textContent;
+          btn.textContent = 'Copied! ✨';
+          btn.style.borderColor = '#00f0ff';
+          btn.style.color = '#00f0ff';
+          setTimeout(() => {
+            btn.textContent = original;
+            btn.style.borderColor = '';
+            btn.style.color = '';
+          }, 2000);
+        }
+      }).catch(() => {
+        prompt('Your 4-Code Group ID (Press Ctrl+C to copy):', myGroupPermanentId);
+      });
+    }
+
+    function startMyPermanentGroupCall() {
+      if (!myGroupPermanentId) return;
+      showGroupStatus('Starting your permanent group room (' + myGroupPermanentId + ')...', 'status-busy');
+      socket.emit('group:create', { customCode: myGroupPermanentId });
     }
 
     // -----------------------------------------------------------------
@@ -2461,14 +3065,442 @@ app.get('*', (req, res) => {
     }
 
     // -----------------------------------------------------------------
+    // GROUP VOICE CALL (4-CODE ROOMS, AUTO-ARRANGE UP TO 10 USERS)
+    // -----------------------------------------------------------------
+    function randomizeGroupCodeInput() {
+      const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+      let code = '';
+      for (let i = 0; i < 4; i++) {
+        code += chars[Math.floor(Math.random() * chars.length)];
+      }
+      const el = document.getElementById('createGroupCodeInput');
+      if (el) el.value = code;
+    }
+
+    function showGroupStatus(msg, cssClass) {
+      const banner = document.getElementById('groupStatusBanner');
+      if (!banner) return;
+      banner.style.display = 'flex';
+      banner.className = 'direct-status-banner ' + cssClass;
+      banner.innerHTML = msg;
+    }
+
+    function checkGroupRoomStatus() {
+      const input = document.getElementById('joinGroupCodeInput');
+      const code = (input.value || '').trim().toUpperCase();
+      if (!code || code.length !== 4) {
+        showGroupStatus('⚠️ Please enter a 4-code Group ID (e.g. 8492)', 'status-offline');
+        input.focus();
+        return;
+      }
+      showGroupStatus('Checking group room on server...', 'status-busy');
+      socket.emit('group:check', { code });
+    }
+
+    function createGroupCall() {
+      const input = document.getElementById('createGroupCodeInput');
+      const customCode = (input.value || '').trim().toUpperCase();
+      if (customCode && customCode.length !== 4) {
+        showGroupStatus('⚠️ Custom group code must be 4 characters.', 'status-offline');
+        input.focus();
+        return;
+      }
+      showGroupStatus('Creating group voice room...', 'status-busy');
+      socket.emit('group:create', { customCode });
+    }
+
+    function joinGroupCall() {
+      const input = document.getElementById('joinGroupCodeInput');
+      const code = (input.value || '').trim().toUpperCase();
+      if (!code || code.length !== 4) {
+        showGroupStatus('⚠️ Please enter a 4-code Group ID (e.g. 8492)', 'status-offline');
+        input.focus();
+        return;
+      }
+      showGroupStatus('Connecting to group room...', 'status-busy');
+      socket.emit('group:join', { code });
+    }
+
+    function copyGroupRoomCode() {
+      if (!currentGroupCode) return;
+      navigator.clipboard.writeText(currentGroupCode).then(() => {
+        const btn = document.getElementById('copyGroupCodeBtnText');
+        if (btn) {
+          const orig = btn.textContent;
+          btn.textContent = 'Copied! ✨';
+          setTimeout(() => { btn.textContent = orig; }, 2000);
+        }
+      }).catch(() => {
+        prompt('Group 4-Code (Press Ctrl+C to copy):', currentGroupCode);
+      });
+    }
+
+    async function ensureLocalMicrophone() {
+      if (localStream) return localStream;
+      const inputDeviceId = document.getElementById('audioInputSelect').value;
+      const noiseSuppression = document.getElementById('noiseSuppressionToggle').checked;
+      const echoCancellation = document.getElementById('echoCancellationToggle').checked;
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: inputDeviceId ? { exact: inputDeviceId } : undefined,
+            echoCancellation,
+            noiseSuppression,
+            autoGainControl: true
+          },
+          video: false
+        });
+      } catch (err) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+
+      if (pushToTalkEnabled) {
+        localStream.getAudioTracks().forEach(t => t.enabled = false);
+        isMicMuted = true;
+      } else {
+        isMicMuted = false;
+        localStream.getAudioTracks().forEach(t => t.enabled = true);
+      }
+      updateMuteButtonDisplay();
+      return localStream;
+    }
+
+    function createGroupPeerConnection(peerSocketId, isInitiator) {
+      if (groupPeerConnections.has(peerSocketId)) {
+        return groupPeerConnections.get(peerSocketId);
+      }
+
+      const pc = new RTCPeerConnection(rtcConfig);
+      groupPeerConnections.set(peerSocketId, pc);
+
+      if (localStream) {
+        localStream.getTracks().forEach(track => {
+          pc.addTrack(track, localStream);
+        });
+      }
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('group:signal:candidate', {
+            toSocketId: peerSocketId,
+            candidate: event.candidate
+          });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        const remoteStream = event.streams[0];
+        groupAudioStreams.set(peerSocketId, remoteStream);
+
+        const container = document.getElementById('groupAudiosContainer');
+        let audioEl = document.getElementById('audio_' + peerSocketId);
+        if (!audioEl) {
+          audioEl = document.createElement('audio');
+          audioEl.id = 'audio_' + peerSocketId;
+          audioEl.autoplay = true;
+          audioEl.playsInline = true;
+          container.appendChild(audioEl);
+        }
+        audioEl.srcObject = remoteStream;
+        audioEl.volume = Math.min(1.0, groupMasterVolume / 100);
+
+        attachPeerAnalyser(peerSocketId, remoteStream);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          cleanupPeerConnection(peerSocketId);
+        }
+      };
+
+      if (isInitiator) {
+        pc.createOffer().then(offer => {
+          return pc.setLocalDescription(offer);
+        }).then(() => {
+          socket.emit('group:signal:offer', {
+            toSocketId: peerSocketId,
+            offer: pc.localDescription
+          });
+        }).catch(err => console.error('Error creating group offer:', err));
+      }
+
+      return pc;
+    }
+
+    function cleanupPeerConnection(peerSocketId) {
+      const pc = groupPeerConnections.get(peerSocketId);
+      if (pc) {
+        pc.close();
+        groupPeerConnections.delete(peerSocketId);
+      }
+      const audioEl = document.getElementById('audio_' + peerSocketId);
+      if (audioEl) audioEl.remove();
+      groupAudioStreams.delete(peerSocketId);
+      groupAnalysers.delete(peerSocketId);
+    }
+
+    function attachPeerAnalyser(peerSocketId, stream) {
+      try {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state === 'suspended') {
+          audioContext.resume();
+        }
+        const src = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 64;
+        src.connect(analyser);
+        groupAnalysers.set(peerSocketId, analyser);
+      } catch (e) {
+        console.warn('Group audio context error:', e);
+      }
+    }
+
+    function adjustGroupVolume(val) {
+      groupMasterVolume = val;
+      const valEl = document.getElementById('groupVolumePercentText');
+      if (valEl) valEl.textContent = val + '%';
+      const container = document.getElementById('groupAudiosContainer');
+      if (container) {
+        const audios = container.querySelectorAll('audio');
+        audios.forEach(a => {
+          a.volume = Math.min(1.0, val / 100);
+        });
+      }
+    }
+
+    // AUTO ARRANGE USERS SMALLER IF MANY USERS (UP TO 10)
+    function renderGroupGrid() {
+      const grid = document.getElementById('groupGrid');
+      if (!grid) return;
+
+      const members = Array.from(groupMembers.values());
+      const totalCount = members.length;
+
+      // Auto arrange responsive layout classes
+      grid.classList.remove('layout-1-2', 'layout-3-4', 'layout-5-6', 'layout-7-8', 'layout-9-10', 'layout-7-10');
+      if (totalCount <= 2) {
+        grid.classList.add('layout-1-2');
+      } else if (totalCount <= 4) {
+        grid.classList.add('layout-3-4');
+      } else if (totalCount <= 6) {
+        grid.classList.add('layout-5-6');
+      } else if (totalCount <= 8) {
+        grid.classList.add('layout-7-8');
+      } else {
+        // 9 to 10 users: auto arrange even smaller!
+        grid.classList.add('layout-9-10');
+      }
+
+      const countText = document.getElementById('groupCountText');
+      if (countText) countText.textContent = totalCount + ' / 10 Users';
+
+      grid.innerHTML = members.map(m => {
+        const isMe = m.socketId === socket.id;
+        const roleLabel = isMe ? 'Local Microphone' : (m.isHost ? 'Group Host' : 'Participant');
+        return '<div class="group-member-card" id="groupCard_' + m.socketId + '">' +
+          (m.isHost ? '<span class="host-badge">👑 Host</span>' : '') +
+          '<div class="participant-avatar" id="groupAvatar_' + m.socketId + '">' + (m.avatar || '🦊') + '</div>' +
+          '<div class="participant-name" title="' + m.username + '">' +
+            m.username + (isMe ? ' <span style="color:var(--accent); font-size:0.75rem;">(You)</span>' : '') +
+          '</div>' +
+          '<div class="participant-role">' + roleLabel + '</div>' +
+          '<canvas id="groupWave_' + m.socketId + '" class="wave-canvas" width="200" height="30"></canvas>' +
+        '</div>';
+      }).join('');
+    }
+
+    function startGroupVisualizerLoop() {
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+
+      const freqData = new Uint8Array(32);
+
+      function drawGroupFrame() {
+        if (localAnalyser && socket.id) {
+          const myCanvas = document.getElementById('groupWave_' + socket.id);
+          const myCard = document.getElementById('groupCard_' + socket.id);
+          if (myCanvas) {
+            const ctx = myCanvas.getContext('2d');
+            localAnalyser.getByteFrequencyData(freqData);
+            renderWaveBars(ctx, myCanvas, freqData, isMicMuted ? '#ef4444' : '#ff2a5f');
+            const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
+            if (myCard) myCard.classList.toggle('talking', avg > 18 && !isMicMuted);
+          }
+        }
+
+        for (const [peerSocketId, analyser] of groupAnalysers.entries()) {
+          const canvas = document.getElementById('groupWave_' + peerSocketId);
+          const card = document.getElementById('groupCard_' + peerSocketId);
+          if (canvas && analyser) {
+            const ctx = canvas.getContext('2d');
+            analyser.getByteFrequencyData(freqData);
+            renderWaveBars(ctx, canvas, freqData, '#00f0ff');
+            const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
+            if (card) card.classList.toggle('talking', avg > 15);
+          }
+        }
+
+        animationFrameId = requestAnimationFrame(drawGroupFrame);
+      }
+
+      drawGroupFrame();
+    }
+
+    function startGroupCallTimer() {
+      stopGroupCallTimer();
+      groupCallSeconds = 0;
+      const timerEl = document.getElementById('groupCallTimer');
+      if (timerEl) timerEl.textContent = '00:00';
+      groupCallTimerInterval = setInterval(() => {
+        groupCallSeconds++;
+        if (timerEl) timerEl.textContent = formatTime(groupCallSeconds);
+      }, 1000);
+    }
+
+    function stopGroupCallTimer() {
+      if (groupCallTimerInterval) {
+        clearInterval(groupCallTimerInterval);
+        groupCallTimerInterval = null;
+      }
+    }
+
+    function leaveGroupCall() {
+      socket.emit('group:leave');
+      cleanupGroupCallLocal();
+      showScreen('homeScreen');
+    }
+
+    function cleanupGroupCallLocal() {
+      stopGroupCallTimer();
+      for (const [peerId] of groupPeerConnections.entries()) {
+        cleanupPeerConnection(peerId);
+      }
+      groupPeerConnections.clear();
+      groupAudioStreams.clear();
+      groupAnalysers.clear();
+      groupMembers.clear();
+      currentGroupCode = null;
+      isGroupHost = false;
+
+      const container = document.getElementById('groupAudiosContainer');
+      if (container) container.innerHTML = '';
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      }
+    }
+
+    // -----------------------------------------------------------------
     // SOCKET EVENTS
     // -----------------------------------------------------------------
-    socket.on('user:registered', ({ permanentId }) => {
+    socket.on('group:status', ({ code, status, memberCount, message }) => {
+      let cssClass = 'status-offline';
+      if (status === 'available') cssClass = 'status-online';
+      else if (status === 'full' || status === 'not_started') cssClass = 'status-busy';
+      showGroupStatus(message, cssClass);
+    });
+
+    socket.on('group:error', ({ code, reason, message }) => {
+      showGroupStatus(message, 'status-offline');
+    });
+
+    socket.on('group:joined_success', async ({ groupCode, isHost, myMember, existingMembers, allMembers }) => {
+      currentGroupCode = groupCode;
+      isGroupHost = isHost;
+
+      const codeDisplay = document.getElementById('currentGroupCodeDisplay');
+      if (codeDisplay) codeDisplay.textContent = groupCode;
+      const ptt = document.getElementById('groupPttBanner');
+      if (ptt) ptt.classList.toggle('active', pushToTalkEnabled);
+
+      groupMembers.clear();
+      allMembers.forEach(m => groupMembers.set(m.socketId, m));
+
+      await ensureLocalMicrophone();
+      if (localStream && !localAnalyser) {
+        if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === 'suspended') audioContext.resume();
+        const src = audioContext.createMediaStreamSource(localStream);
+        localAnalyser = audioContext.createAnalyser();
+        localAnalyser.fftSize = 64;
+        src.connect(localAnalyser);
+      }
+
+      showScreen('groupCallScreen');
+      renderGroupGrid();
+      startGroupCallTimer();
+      startGroupVisualizerLoop();
+
+      existingMembers.forEach(peer => {
+        createGroupPeerConnection(peer.socketId, true);
+      });
+    });
+
+    socket.on('group:member_joined', ({ newMember, totalCount, allMembers }) => {
+      groupMembers.set(newMember.socketId, newMember);
+      renderGroupGrid();
+    });
+
+    socket.on('group:member_left', ({ leftSocketId, totalCount, allMembers }) => {
+      cleanupPeerConnection(leftSocketId);
+      groupMembers.delete(leftSocketId);
+      allMembers.forEach(m => groupMembers.set(m.socketId, m));
+      renderGroupGrid();
+    });
+
+    socket.on('group:left', () => {
+      cleanupGroupCallLocal();
+      showScreen('homeScreen');
+    });
+
+    socket.on('group:signal:offer', async ({ fromSocketId, offer }) => {
+      await ensureLocalMicrophone();
+      const pc = createGroupPeerConnection(fromSocketId, false);
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('group:signal:answer', {
+          toSocketId: fromSocketId,
+          answer
+        });
+      } catch (err) {
+        console.error('Error handling group offer:', err);
+      }
+    });
+
+    socket.on('group:signal:answer', async ({ fromSocketId, answer }) => {
+      const pc = groupPeerConnections.get(fromSocketId);
+      if (pc) {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        } catch (err) {
+          console.error('Error handling group answer:', err);
+        }
+      }
+    });
+
+    socket.on('group:signal:candidate', async ({ fromSocketId, candidate }) => {
+      const pc = groupPeerConnections.get(fromSocketId);
+      if (pc && candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding group ICE candidate:', err);
+        }
+      }
+    });
+    socket.on('user:registered', ({ permanentId, groupPermanentId }) => {
       if (permanentId) {
         myPermanentId = permanentId;
         localStorage.setItem('zuki_permanent_id', myPermanentId);
-        updateHomeProfileDisplay();
       }
+      if (groupPermanentId) {
+        myGroupPermanentId = groupPermanentId;
+        localStorage.setItem('zuki_group_permanent_id', myGroupPermanentId);
+      }
+      updateHomeProfileDisplay();
     });
 
     socket.on('stats:update', ({ onlineCount, inCallCount }) => {
@@ -3118,9 +4150,17 @@ app.get('*', (req, res) => {
       const nameEl = document.getElementById('homeUsernamePreview');
       const avatarEl = document.getElementById('homeAvatarPreview');
       const permIdEl = document.getElementById('homePermanentIdPreview');
+      const groupPermIdEl = document.getElementById('homeGroupPermanentIdPreview');
+      const myGroupCodeBadge = document.getElementById('myGroupCodeBadge');
+      const startMyGroupBtnText = document.getElementById('startMyGroupBtnText');
+
       if (nameEl) nameEl.textContent = myUsername || 'Click to set codename';
       if (avatarEl) avatarEl.textContent = myAvatar;
       if (permIdEl) permIdEl.textContent = myPermanentId || 'ZK-......';
+      if (groupPermIdEl) groupPermIdEl.textContent = myGroupPermanentId || '----';
+      if (myGroupCodeBadge) myGroupCodeBadge.textContent = myGroupPermanentId || '----';
+      if (startMyGroupBtnText) startMyGroupBtnText.textContent = '🔥 Start My Group (' + (myGroupPermanentId || '----') + ')';
+
       if (document.getElementById('usernameInput')) {
         document.getElementById('usernameInput').value = myUsername;
       }
