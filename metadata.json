@@ -1,0 +1,6 @@
+{
+  "name": "Zuki Voice Talk",
+  "description": "Real-time 1-on-1 random WebRTC voice talk with real live people, Azuki aesthetic, dynamic matching, and complete audio controls.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
